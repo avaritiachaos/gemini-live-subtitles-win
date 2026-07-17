@@ -25,6 +25,37 @@ STATUS_COLORS = {
 }
 
 
+class UnlockOverlay(QWidget):
+    """穿透模式下外挂的解锁小按钮：独立窗口、不穿透、半透明待机。"""
+
+    clicked = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        btn = QPushButton("🔓", self)
+        btn.setFixedSize(30, 30)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip("解除鼠标穿透")
+        btn.setStyleSheet(
+            "QPushButton{color:white;background:rgba(30,30,30,220);"
+            "border:none;border-radius:15px;font-size:14px;}"
+            "QPushButton:hover{background:rgba(80,80,80,240);}"
+        )
+        btn.clicked.connect(self.clicked)
+        self.resize(30, 30)
+        self.setWindowOpacity(0.4)
+
+    def enterEvent(self, event):
+        self.setWindowOpacity(1.0)
+
+    def leaveEvent(self, event):
+        self.setWindowOpacity(0.4)
+
+
 class SubtitleHud(QWidget):
     startRequested = Signal()
     stopRequested = Signal()
@@ -70,7 +101,7 @@ class SubtitleHud(QWidget):
         self.btn_settings = QPushButton("⚙")
         self.btn_quit = QPushButton("✕")
         self.btn_history.setToolTip("历史记录 / 导出")
-        self.btn_lock.setToolTip("鼠标穿透（用托盘或 Ctrl+Alt+L 解除）")
+        self.btn_lock.setToolTip("鼠标穿透（点右上角 🔓、托盘或 Ctrl+Alt+L 解除）")
         for b in (self.btn_toggle, self.btn_history, self.btn_lock,
                   self.btn_settings, self.btn_quit):
             b.setFixedSize(30, 30)
@@ -92,29 +123,42 @@ class SubtitleHud(QWidget):
         self.btn_quit.clicked.connect(self.quitRequested)
 
         bar = QHBoxLayout()
-        bar.setContentsMargins(8, 0, 8, 0)
+        bar.setContentsMargins(10, 3, 10, 3)
         bar.addWidget(self.status_label)
         bar.addWidget(self.status_text)
         bar.addStretch(1)
         for b in (self.btn_toggle, self.btn_history, self.btn_lock,
                   self.btn_settings, self.btn_quit):
             bar.addWidget(b)
-        self._bar_widget = QWidget()
+        # 浮层控制栏：不进布局，悬浮在字幕上方右上角，出现/消失不挤动字幕
+        self._bar_widget = QWidget(self)
         self._bar_widget.setLayout(bar)
+        self._bar_widget.setAttribute(Qt.WA_StyledBackground, True)
+        self._bar_widget.setStyleSheet(
+            "background:rgba(15,15,15,215);border-radius:17px;"
+        )
         self._bar_widget.setVisible(False)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 6, 16, 10)
-        layout.addWidget(self._bar_widget)
+        layout.setContentsMargins(16, 8, 16, 10)
         layout.addWidget(self.orig_label)
         layout.addWidget(self.label)
 
-        grip = QSizeGrip(self)
-        grip.setFixedSize(14, 14)
+        self._grip = QSizeGrip(self)
+        self._grip.setFixedSize(14, 14)
 
         self.resize(width, 110)
 
     # ---- 外观 ----
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._grip.move(self.width() - 16, self.height() - 16)
+        self._position_bar()
+
+    def _position_bar(self) -> None:
+        self._bar_widget.adjustSize()
+        self._bar_widget.move(self.width() - self._bar_widget.width() - 10, 6)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -206,6 +250,8 @@ class SubtitleHud(QWidget):
             f"color:{STATUS_COLORS.get(kind, '#888888')};background:transparent;"
         )
         self.status_text.setText(message)
+        if self._bar_widget.isVisible():
+            self._position_bar()
         if kind == "error":
             self.label.setText(message)
 
@@ -226,6 +272,8 @@ class SubtitleHud(QWidget):
 
     def enterEvent(self, event):
         self._bar_widget.setVisible(True)
+        self._bar_widget.raise_()
+        self._position_bar()
 
     def leaveEvent(self, event):
         self._bar_widget.setVisible(False)

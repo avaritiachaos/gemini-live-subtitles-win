@@ -8,17 +8,18 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes
+import re
 import sys
 import time
 
-from PySide6.QtCore import Qt, QAbstractNativeEventFilter
+from PySide6.QtCore import Qt, QAbstractNativeEventFilter, QTimer
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont, QAction
 from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon, QMenu
 
 from config import Config
 from audio_capture import AudioCapture, AudioCaptureError
 from gemini_client import GeminiClient
-from subtitle_hud import SubtitleHud
+from subtitle_hud import SubtitleHud, UnlockOverlay
 from settings_dialog import SettingsDialog
 from history import HistoryStore, HistoryWindow, Entry
 
@@ -27,6 +28,11 @@ MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 HOTKEY_TOGGLE = 1       # Ctrl+Alt+T
 HOTKEY_CLICKTHROUGH = 2  # Ctrl+Alt+L
+
+# 历史成句：说话停顿判定 / 过长强制切分
+SENTENCE_IDLE_MS = 2500
+SENTENCE_MAX_CHARS = 80
+SENT_SPLIT = re.compile(r"(?<=[。！？!?…；;])")
 
 
 class _HotkeyFilter(QAbstractNativeEventFilter):
@@ -75,6 +81,11 @@ class App:
         self._sent_text = ""
         self._sent_orig = ""
         self._sent_start = 0.0
+        # Live Translate 是连续流，几乎不发 turnComplete——用"停顿即成句"兜底
+        self._flush_timer = QTimer()
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.setInterval(SENTENCE_IDLE_MS)
+        self._flush_timer.timeout.connect(lambda: self._flush_history(break_hud=True))
 
         self.hud = SubtitleHud(
             font_size=self.cfg.font_size,
@@ -94,6 +105,9 @@ class App:
         self.hud.historyRequested.connect(self.show_history)
         self.hud.lockRequested.connect(lambda: self.set_click_through(True))
         self.hud.quitRequested.connect(self.quit)
+
+        self.unlock_overlay = UnlockOverlay()
+        self.unlock_overlay.clicked.connect(lambda: self.set_click_through(False))
 
         self.client.subtitle.connect(self._on_subtitle)
         self.client.original.connect(self._on_original)
@@ -171,24 +185,48 @@ class App:
             self._sent_start = time.time()
         self._sent_text += text
         self.hud.append_text(text)
+        self._flush_timer.start()
+        # 句子过长：在最后一个句末标点处切分入库，避免一整段憋成一条
+        if len(self._sent_text) >= SENTENCE_MAX_CHARS:
+            parts = SENT_SPLIT.split(self._sent_text)
+            if len(parts) > 1:
+                head = "".join(parts[:-1]).strip()
+                if head:
+                    self.history.add(Entry(
+                        start=self._sent_start,
+                        end=time.time(),
+                        text=head,
+                        orig=self._sent_orig.strip() if self.cfg.show_original else "",
+                    ))
+                    self._sent_text = parts[-1]
+                    self._sent_orig = ""
+                    self._sent_start = time.time()
 
     def _on_original(self, text: str) -> None:
         if not self._sent_text and not self._sent_orig:
             self._sent_start = time.time()
         self._sent_orig += text
         self.hud.append_original(text)
+        self._flush_timer.start()
 
-    def _on_turn_complete(self) -> None:
-        if self._sent_text.strip():
+    def _flush_history(self, break_hud: bool = False) -> None:
+        """把当前累积的句子写入历史（停顿、turnComplete、停止时调用）。"""
+        self._flush_timer.stop()
+        text = self._sent_text.strip()
+        if text:
             self.history.add(Entry(
                 start=self._sent_start,
                 end=time.time(),
-                text=self._sent_text.strip(),
+                text=text,
                 orig=self._sent_orig.strip() if self.cfg.show_original else "",
             ))
         self._sent_text = ""
         self._sent_orig = ""
-        self.hud.finish_sentence()
+        if break_hud:
+            self.hud.finish_sentence()
+
+    def _on_turn_complete(self) -> None:
+        self._flush_history(break_hud=True)
 
     def show_history(self) -> None:
         self.history_window.show()
@@ -202,11 +240,17 @@ class App:
         self.act_lock.setChecked(enabled)
         self.hud.set_click_through(enabled)
         if enabled:
+            g = self.hud.frameGeometry()
+            self.unlock_overlay.move(g.right() - 36, g.top() + 6)
+            self.unlock_overlay.show()
+            self.unlock_overlay.raise_()
             self.tray.showMessage(
                 "鼠标穿透已开启",
-                "点击托盘图标或按 Ctrl+Alt+L 解除",
+                "点字幕条右上角 🔓、托盘图标或 Ctrl+Alt+L 解除",
                 QSystemTrayIcon.Information, 3000,
             )
+        else:
+            self.unlock_overlay.hide()
 
     # ---- 会话控制 ----
 
@@ -245,6 +289,7 @@ class App:
         self.act_toggle.setText("停止翻译 (Ctrl+Alt+T)")
 
     def stop_session(self) -> None:
+        self._flush_history(break_hud=False)
         if self.capture is not None:
             self.capture.stop()
             self.capture = None
@@ -254,6 +299,7 @@ class App:
 
     def _on_client_stopped(self) -> None:
         # 客户端因错误自行退出时，同步停掉采集并复位按钮
+        self._flush_history(break_hud=False)
         if self.capture is not None:
             self.capture.stop()
             self.capture = None
