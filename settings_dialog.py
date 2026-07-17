@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QComboBox, QSpinBox, QCheckBox,
     QDialogButtonBox, QLabel, QPushButton, QSlider, QHBoxLayout,
-    QColorDialog,
+    QColorDialog, QPlainTextEdit,
 )
 
 from config import Config, LANGUAGES, DEFAULT_MODEL
@@ -78,6 +78,13 @@ class SettingsDialog(QDialog):
         self.ed_model = QLineEdit(cfg.model)
         self.ed_model.setPlaceholderText(DEFAULT_MODEL)
 
+        self.ed_prompt = QPlainTextEdit(cfg.system_prompt)
+        self.ed_prompt.setFixedHeight(64)
+        self.ed_prompt.setPlaceholderText(
+            "可选。例：音频来自日语直播，输出口语化中文，"
+            "人名与专有名词保留常用译名，语气词可省略。"
+        )
+
         hint = QLabel(
             '免费 API key: <a href="https://aistudio.google.com/apikey">aistudio.google.com/apikey</a>'
             "<br>国内网络需要系统代理（程序自动读取 HTTPS_PROXY 环境变量）"
@@ -97,6 +104,7 @@ class SettingsDialog(QDialog):
         form.addRow("字幕颜色:", self.btn_color)
         form.addRow("背景不透明度:", op_row)
         form.addRow("模型:", self.ed_model)
+        form.addRow("翻译提示词:", self.ed_prompt)
         form.addRow(hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -132,5 +140,6 @@ class SettingsDialog(QDialog):
         self.cfg.text_color = self._text_color
         self.cfg.bg_opacity = round(self.sl_opacity.value() * 255 / 100)
         self.cfg.model = self.ed_model.text().strip() or DEFAULT_MODEL
+        self.cfg.system_prompt = self.ed_prompt.toPlainText().strip()
         self.cfg.save()
         super().accept()

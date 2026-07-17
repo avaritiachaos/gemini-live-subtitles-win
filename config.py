@@ -37,6 +37,8 @@ class Config:
     api_base: str = DEFAULT_API_BASE
     model: str = DEFAULT_MODEL
     target_language: str = "zh-CN"
+    system_prompt: str = ""        # 翻译提示词（可选），如"日语直播，口语化中文"
+    response_modality: str = "AUDIO"  # AUDIO(默认,稳) | TEXT(实验,省配额)
     audio_source: str = "system"  # "system" | "mic"
     device_name: str = ""  # 系统音频模式下要监听的输出设备名；空 = 默认输出
     font_size: int = 20
@@ -56,6 +58,10 @@ class Config:
         self.model = str(self.model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
         if self.target_language not in {code for code, _ in LANGUAGES}:
             self.target_language = "zh-CN"
+        self.system_prompt = str(self.system_prompt or "").strip()
+        self.response_modality = str(self.response_modality or "AUDIO").strip().upper()
+        if self.response_modality not in ("AUDIO", "TEXT"):
+            self.response_modality = "AUDIO"
         if self.audio_source not in ("system", "mic"):
             self.audio_source = "system"
         self.device_name = str(self.device_name or "").strip()

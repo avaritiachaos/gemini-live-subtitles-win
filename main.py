@@ -284,6 +284,8 @@ class App:
             api_base=self.cfg.api_base,
             model=self.cfg.model,
             target_lang=self.cfg.target_language,
+            system_prompt=self.cfg.system_prompt,
+            response_modality=self.cfg.response_modality,
         )
         self.hud.set_running(True, clear=not preserve_text)
         self.act_toggle.setText("停止翻译 (Ctrl+Alt+T)")
@@ -317,6 +319,7 @@ class App:
             self.cfg.api_key, self.cfg.api_base, self.cfg.model,
             self.cfg.target_language, self.cfg.audio_source,
             self.cfg.device_name, self.cfg.vad_enabled, self.cfg.vad_threshold,
+            self.cfg.system_prompt,
         )
         dlg = SettingsDialog(self.cfg, parent=self.hud)
         if not dlg.exec():
@@ -329,6 +332,7 @@ class App:
             self.cfg.api_key, self.cfg.api_base, self.cfg.model,
             self.cfg.target_language, self.cfg.audio_source,
             self.cfg.device_name, self.cfg.vad_enabled, self.cfg.vad_threshold,
+            self.cfg.system_prompt,
         )
         if after != before and self.client.running:
             self._pending_restart = True

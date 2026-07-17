@@ -16,7 +16,8 @@ from PySide6.QtCore import QObject, Signal
 
 WS_PATH = "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
 SETUP_TIMEOUT_SEC = 10.0
-MAX_PENDING_SENDS = 20
+# 实时音频队列上限（块≈100ms）：满了丢最旧的，永远优先发最新音频
+AUDIO_QUEUE_MAX = 10
 MAX_SETUP_FAILURES = 3
 MAX_RECONNECT_DELAY = 30.0
 RECONNECT_STABLE_SEC = 10.0
@@ -48,7 +49,7 @@ class GeminiClient(QObject):
         self._thread: Optional[threading.Thread] = None
         self._ws = None
         self._running = False
-        self._pending = 0
+        self._queue: Optional[asyncio.Queue] = None
         self._dropped = 0
         self._lock = threading.Lock()
         # 会话参数（start 时快照）
@@ -56,10 +57,13 @@ class GeminiClient(QObject):
         self._api_base = ""
         self._model = ""
         self._target_lang = "zh-CN"
+        self._system_prompt = ""
+        self._response_modality = "AUDIO"
 
     # ---- 公共接口（主线程调用） ----
 
-    def start(self, api_key: str, api_base: str, model: str, target_lang: str) -> None:
+    def start(self, api_key: str, api_base: str, model: str, target_lang: str,
+              system_prompt: str = "", response_modality: str = "AUDIO") -> None:
         with self._lock:
             if self._running:
                 return
@@ -68,6 +72,8 @@ class GeminiClient(QObject):
         self._api_base = api_base
         self._model = model
         self._target_lang = target_lang
+        self._system_prompt = system_prompt.strip()
+        self._response_modality = response_modality
         self._thread = threading.Thread(target=self._thread_main, daemon=True, name="gemini-ws")
         self._thread.start()
 
@@ -86,27 +92,37 @@ class GeminiClient(QObject):
             return self._running
 
     def send_audio(self, pcm16: bytes) -> None:
-        """音频采集线程调用；连接未就绪或积压过多时丢弃。"""
+        """音频采集线程调用；投递到 asyncio 线程的实时队列（满则丢最旧）。"""
         loop = self._loop
         if loop is None or not self.running:
             return
-        if self._pending >= MAX_PENDING_SENDS:
-            self._dropped += 1
-            return
-        self._pending += 1
         try:
-            asyncio.run_coroutine_threadsafe(self._send_audio_async(pcm16), loop)
+            loop.call_soon_threadsafe(self._enqueue_audio, pcm16)
         except RuntimeError:
-            self._pending -= 1
+            pass  # loop 正在关闭
+
+    def _enqueue_audio(self, pcm16: bytes) -> None:
+        q = self._queue
+        if q is None:
+            return
+        if q.full():
+            try:
+                q.get_nowait()
+                self._dropped += 1
+            except asyncio.QueueEmpty:
+                pass
+        q.put_nowait(pcm16)
 
     # ---- asyncio 线程 ----
 
     def _thread_main(self) -> None:
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
+        self._queue = asyncio.Queue(maxsize=AUDIO_QUEUE_MAX)
         try:
             self._loop.run_until_complete(self._session_loop())
         finally:
+            self._queue = None
             self._loop.close()
             self._loop = None
             with self._lock:
@@ -134,7 +150,18 @@ class GeminiClient(QObject):
                     setup_failures = 0
                     connected_at = asyncio.get_event_loop().time()
                     self.status.emit(KIND_CONNECTED, "已连接")
-                    await self._recv_loop(ws)
+                    # 丢掉断线期间积压的旧音频，从最新处开始
+                    while not self._queue.empty():
+                        self._queue.get_nowait()
+                    sender = asyncio.ensure_future(self._sender_loop(ws))
+                    try:
+                        await self._recv_loop(ws)
+                    finally:
+                        sender.cancel()
+                        try:
+                            await sender
+                        except (asyncio.CancelledError, Exception):
+                            pass
             except asyncio.TimeoutError:
                 setup_failures += 1
                 if setup_failures >= MAX_SETUP_FAILURES:
@@ -179,7 +206,6 @@ class GeminiClient(QObject):
                 self.status.emit(KIND_ERROR, f"网络错误: {e}")
             finally:
                 self._ws = None
-                self._pending = 0
 
             if not self.running:
                 return
@@ -200,7 +226,7 @@ class GeminiClient(QObject):
         setup = {
             "model": self._model,
             "generationConfig": {
-                "responseModalities": ["AUDIO"],
+                "responseModalities": [self._response_modality],
                 "translationConfig": {
                     "targetLanguageCode": self._target_lang,
                     "echoTargetLanguage": False,
@@ -213,6 +239,8 @@ class GeminiClient(QObject):
                 "slidingWindow": {"targetTokens": "0"},
             },
         }
+        if self._system_prompt:
+            setup["systemInstruction"] = {"parts": [{"text": self._system_prompt}]}
         await ws.send(json.dumps({"setup": setup}))
 
     async def _wait_setup_complete(self, ws) -> None:
@@ -273,11 +301,10 @@ class GeminiClient(QObject):
         if content.get("turnComplete") or content.get("generationComplete"):
             self.turnComplete.emit()
 
-    async def _send_audio_async(self, pcm16: bytes) -> None:
-        try:
-            ws = self._ws
-            if ws is None:
-                return
+    async def _sender_loop(self, ws) -> None:
+        """专职发送任务：从实时队列取最新音频块发出。"""
+        while True:
+            pcm16 = await self._queue.get()
             msg = {
                 "realtimeInput": {
                     "audio": {
@@ -287,7 +314,3 @@ class GeminiClient(QObject):
                 }
             }
             await ws.send(json.dumps(msg))
-        except Exception:
-            pass  # 断线由 recv_loop 统一处理
-        finally:
-            self._pending = max(0, self._pending - 1)

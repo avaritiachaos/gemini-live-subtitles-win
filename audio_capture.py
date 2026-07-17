@@ -17,6 +17,18 @@ import numpy as np
 TARGET_RATE = 16000
 CHUNK_MS = 100  # 每块约 100ms
 VAD_HANGOVER_CHUNKS = 8  # 语音结束后继续上传 ~0.8s，避免截掉句尾
+LPF_TAPS = 31            # 抗混叠 FIR 阶数
+LPF_CUTOFF_HZ = 7000.0   # 降采样到 16k 前的低通截止
+
+
+def _design_lpf(device_rate: int) -> np.ndarray:
+    """加窗 sinc 低通：防止 BGM/音效的高频在降采样时折叠进语音频段。"""
+    fc = LPF_CUTOFF_HZ / device_rate  # 归一化 (0..0.5)
+    n = np.arange(LPF_TAPS) - (LPF_TAPS - 1) / 2
+    h = 2 * fc * np.sinc(2 * fc * n)
+    h *= np.hamming(LPF_TAPS)
+    h /= h.sum()
+    return h.astype(np.float32)
 
 
 class AudioCaptureError(Exception):
@@ -68,6 +80,8 @@ class AudioCapture:
         self._device_channels = 1
         self._resample_pos = 0.0  # 线性插值重采样的相位余量
         self._tail = np.zeros(0, dtype=np.float32)
+        self._lpf: Optional[np.ndarray] = None
+        self._lpf_tail = np.zeros(0, dtype=np.float32)
 
     # ---- 设备选择 ----
 
@@ -114,6 +128,9 @@ class AudioCapture:
 
         self._device_rate = int(device["defaultSampleRate"])
         self._device_channels = max(1, int(device["maxInputChannels"]))
+        if self._device_rate > TARGET_RATE:
+            self._lpf = _design_lpf(self._device_rate)
+            self._lpf_tail = np.zeros(LPF_TAPS - 1, dtype=np.float32)
         frames = int(self._device_rate * CHUNK_MS / 1000)
         try:
             self._stream = self._pa.open(
@@ -136,6 +153,8 @@ class AudioCapture:
                 pcm = pcm.reshape(-1, self._device_channels).mean(axis=1)
             data = pcm.astype(np.float32)
             if self._gate(data):
+                if self._lpf is not None:
+                    data = self._lpf_apply(data)
                 if self._device_rate != TARGET_RATE:
                     data = self._resample(data)
                 if data.size:
@@ -156,10 +175,19 @@ class AudioCapture:
         if self._voice_hold > 0:
             self._voice_hold -= 1
             return True
-        # 长静音：把重采样相位也复位，避免恢复时残留旧尾巴
+        # 长静音：把滤波与重采样状态复位，避免恢复时残留旧尾巴
         self._tail = np.zeros(0, dtype=np.float32)
         self._resample_pos = 0.0
+        if self._lpf is not None:
+            self._lpf_tail = np.zeros(LPF_TAPS - 1, dtype=np.float32)
         return False
+
+    def _lpf_apply(self, data: np.ndarray) -> np.ndarray:
+        """流式 FIR 低通（块间用尾巴衔接，输出与输入等长且相位连续）。"""
+        src = np.concatenate([self._lpf_tail, data])
+        out = np.convolve(src, self._lpf, mode="valid")
+        self._lpf_tail = src[-(LPF_TAPS - 1):]
+        return out
 
     def _resample(self, data: np.ndarray) -> np.ndarray:
         """流式线性插值重采样（块间保持相位连续）。"""
@@ -212,3 +240,5 @@ class AudioCapture:
         self._tail = np.zeros(0, dtype=np.float32)
         self._resample_pos = 0.0
         self._voice_hold = 0
+        self._lpf = None
+        self._lpf_tail = np.zeros(0, dtype=np.float32)
