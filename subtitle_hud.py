@@ -1,4 +1,8 @@
-"""悬浮字幕条 HUD：无边框、置顶、半透明，可拖动，hover 显示控制按钮。"""
+"""悬浮字幕条 HUD：无边框、置顶、半透明，可拖动，hover 显示控制按钮。
+
+支持双语显示（原文小字 + 译文大字）、自定义文字颜色/背景不透明度、
+鼠标穿透模式（穿透时通过托盘或全局快捷键解除）。
+"""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QPoint, Signal
@@ -8,8 +12,9 @@ from PySide6.QtWidgets import (
     QApplication,
 )
 
-MAX_LINES = 2       # 屏幕上保留的行数
+MAX_LINES = 2       # 屏幕上保留的译文行数
 MAX_LINE_CHARS = 42  # 单行大致换行宽度（按 CJK 字符估算）
+MAX_ORIG_CHARS = 80  # 原文行最多保留的尾部字符数
 
 STATUS_COLORS = {
     "idle": "#888888",
@@ -24,9 +29,13 @@ class SubtitleHud(QWidget):
     startRequested = Signal()
     stopRequested = Signal()
     settingsRequested = Signal()
+    historyRequested = Signal()
+    lockRequested = Signal()
     quitRequested = Signal()
 
-    def __init__(self, font_size: int = 20, width: int = 900):
+    def __init__(self, font_size: int = 20, width: int = 900,
+                 text_color: str = "#FFFFFF", bg_opacity: int = 170,
+                 show_original: bool = False):
         super().__init__()
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
@@ -34,21 +43,36 @@ class SubtitleHud(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._drag_pos: QPoint | None = None
         self._lines: list[str] = []
-        self._current = ""  # 正在生成的句子
+        self._current = ""       # 正在生成的译文句
+        self._orig_current = ""  # 正在生成的原文句
         self._is_running = False
+        self._text_color = text_color
+        self._bg_opacity = bg_opacity
+        self._font_size = font_size
+        self._show_original = show_original
 
-        # 字幕文本
+        # 原文（小字，双语模式）
+        self.orig_label = QLabel("")
+        self.orig_label.setAlignment(Qt.AlignCenter)
+        self.orig_label.setVisible(show_original)
+
+        # 译文
         self.label = QLabel("点击 ▶ 开始同传字幕")
         self.label.setWordWrap(True)
         self.label.setAlignment(Qt.AlignCenter)
-        self.label.setStyleSheet("color: white; background: transparent;")
-        self.set_font_size(font_size)
+
+        self._apply_style()
 
         # 控制栏（hover 显示）
         self.btn_toggle = QPushButton("▶")
+        self.btn_history = QPushButton("📜")
+        self.btn_lock = QPushButton("🔒")
         self.btn_settings = QPushButton("⚙")
         self.btn_quit = QPushButton("✕")
-        for b in (self.btn_toggle, self.btn_settings, self.btn_quit):
+        self.btn_history.setToolTip("历史记录 / 导出")
+        self.btn_lock.setToolTip("鼠标穿透（用托盘或 Ctrl+Alt+L 解除）")
+        for b in (self.btn_toggle, self.btn_history, self.btn_lock,
+                  self.btn_settings, self.btn_quit):
             b.setFixedSize(30, 30)
             b.setCursor(Qt.PointingHandCursor)
             b.setStyleSheet(
@@ -62,6 +86,8 @@ class SubtitleHud(QWidget):
         self.status_text.setStyleSheet("color:#bbbbbb;background:transparent;font-size:12px;")
 
         self.btn_toggle.clicked.connect(self._on_toggle)
+        self.btn_history.clicked.connect(self.historyRequested)
+        self.btn_lock.clicked.connect(self.lockRequested)
         self.btn_settings.clicked.connect(self.settingsRequested)
         self.btn_quit.clicked.connect(self.quitRequested)
 
@@ -70,9 +96,9 @@ class SubtitleHud(QWidget):
         bar.addWidget(self.status_label)
         bar.addWidget(self.status_text)
         bar.addStretch(1)
-        bar.addWidget(self.btn_toggle)
-        bar.addWidget(self.btn_settings)
-        bar.addWidget(self.btn_quit)
+        for b in (self.btn_toggle, self.btn_history, self.btn_lock,
+                  self.btn_settings, self.btn_quit):
+            bar.addWidget(b)
         self._bar_widget = QWidget()
         self._bar_widget.setLayout(bar)
         self._bar_widget.setVisible(False)
@@ -80,6 +106,7 @@ class SubtitleHud(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 6, 16, 10)
         layout.addWidget(self._bar_widget)
+        layout.addWidget(self.orig_label)
         layout.addWidget(self.label)
 
         grip = QSizeGrip(self)
@@ -92,14 +119,36 @@ class SubtitleHud(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        p.setBrush(QBrush(QColor(0, 0, 0, 170)))
+        c = QColor(0, 0, 0, self._bg_opacity)
+        p.setBrush(QBrush(c))
         p.setPen(Qt.NoPen)
         p.drawRoundedRect(self.rect(), 12, 12)
 
-    def set_font_size(self, size: int) -> None:
-        f = QFont("Microsoft YaHei", size)
+    def _apply_style(self) -> None:
+        f = QFont("Microsoft YaHei", self._font_size)
         f.setWeight(QFont.DemiBold)
         self.label.setFont(f)
+        self.label.setStyleSheet(f"color:{self._text_color};background:transparent;")
+        of = QFont("Microsoft YaHei", max(9, int(self._font_size * 0.55)))
+        self.orig_label.setFont(of)
+        self.orig_label.setStyleSheet("color:#9fd0ff;background:transparent;")
+
+    def apply_appearance(self, font_size: int, text_color: str,
+                         bg_opacity: int, show_original: bool) -> None:
+        self._font_size = font_size
+        self._text_color = text_color
+        self._bg_opacity = bg_opacity
+        self._show_original = show_original
+        self.orig_label.setVisible(show_original)
+        if not show_original:
+            self.orig_label.setText("")
+        self._apply_style()
+        self.update()
+
+    def set_click_through(self, enabled: bool) -> None:
+        # 改 window flag 会让窗口隐藏，需要重新 show
+        self.setWindowFlag(Qt.WindowTransparentForInput, enabled)
+        self.show()
 
     def place_default(self) -> None:
         screen = QApplication.primaryScreen().availableGeometry()
@@ -112,22 +161,31 @@ class SubtitleHud(QWidget):
 
     def append_text(self, text: str) -> None:
         self._current += text
-        # 过长时把当前句滚动进历史行
         while len(self._current) > MAX_LINE_CHARS:
             self._push_line(self._current[:MAX_LINE_CHARS])
             self._current = self._current[MAX_LINE_CHARS:]
         self._render()
 
+    def append_original(self, text: str) -> None:
+        if not self._show_original:
+            return
+        self._orig_current += text
+        shown = self._orig_current[-MAX_ORIG_CHARS:]
+        self.orig_label.setText(("…" if len(self._orig_current) > MAX_ORIG_CHARS else "") + shown)
+
     def finish_sentence(self) -> None:
         if self._current.strip():
             self._push_line(self._current)
         self._current = ""
+        self._orig_current = ""
         self._render()
 
     def clear_text(self) -> None:
         self._lines.clear()
         self._current = ""
+        self._orig_current = ""
         self.label.setText("")
+        self.orig_label.setText("")
 
     def _push_line(self, line: str) -> None:
         self._lines.append(line)

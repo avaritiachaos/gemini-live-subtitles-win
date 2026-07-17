@@ -37,6 +37,7 @@ class _GoAway(Exception):
 
 class GeminiClient(QObject):
     subtitle = Signal(str)        # 增量译文文本
+    original = Signal(str)        # 增量原文转写（双语字幕用）
     turnComplete = Signal()       # 一句结束
     status = Signal(str, str)     # (kind, message)
     stopped = Signal()            # 会话彻底结束（用户停止或永久错误）
@@ -166,8 +167,14 @@ class GeminiClient(QObject):
                     return
                 self.status.emit(KIND_INFO, "连接断开，准备重连")
             except RuntimeError as e:
-                self.status.emit(KIND_ERROR, str(e))
-                return
+                msg = str(e)
+                # 免费层 TPM 限流等配额错误：退避重连而不是停死
+                lowered = msg.lower()
+                if any(k in lowered for k in ("resource_exhausted", "quota", "rate limit", "exhausted")):
+                    self.status.emit(KIND_INFO, "触发限流，稍后自动重连")
+                else:
+                    self.status.emit(KIND_ERROR, msg)
+                    return
             except OSError as e:
                 self.status.emit(KIND_ERROR, f"网络错误: {e}")
             finally:
@@ -180,7 +187,13 @@ class GeminiClient(QObject):
             now = asyncio.get_event_loop().time()
             if connected_at is not None and now - connected_at >= RECONNECT_STABLE_SEC:
                 delay = 1.0
-            await asyncio.sleep(delay)
+            # 带倒计时的等待（每秒醒来，用户点停止能及时退出）
+            remaining = delay
+            while remaining > 0 and self.running:
+                if delay >= 2:
+                    self.status.emit(KIND_INFO, f"{int(remaining)} 秒后重连…")
+                await asyncio.sleep(min(1.0, remaining))
+                remaining -= 1.0
             delay = min(delay * 2, MAX_RECONNECT_DELAY)
 
     async def _send_setup(self, ws) -> None:
@@ -252,6 +265,11 @@ class GeminiClient(QObject):
             text = out.get("text")
             if text:
                 self.subtitle.emit(text)
+        inp = content.get("inputTranscription")
+        if isinstance(inp, dict):
+            text = inp.get("text")
+            if text:
+                self.original.emit(text)
         if content.get("turnComplete") or content.get("generationComplete"):
             self.turnComplete.emit()
 

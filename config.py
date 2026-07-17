@@ -38,7 +38,14 @@ class Config:
     model: str = DEFAULT_MODEL
     target_language: str = "zh-CN"
     audio_source: str = "system"  # "system" | "mic"
+    device_name: str = ""  # 系统音频模式下要监听的输出设备名；空 = 默认输出
     font_size: int = 20
+    show_original: bool = False    # 双语字幕：显示原文转写
+    vad_enabled: bool = True       # 静音时暂停上传音频（省 TPM 配额）
+    vad_threshold: int = 200       # RMS 阈值（int16 幅度）
+    click_through: bool = False    # 鼠标穿透
+    text_color: str = "#FFFFFF"
+    bg_opacity: int = 170          # 0-255
     hud_x: int = -1  # -1 = 屏幕底部居中
     hud_y: int = -1
     hud_width: int = 900
@@ -51,6 +58,21 @@ class Config:
             self.target_language = "zh-CN"
         if self.audio_source not in ("system", "mic"):
             self.audio_source = "system"
+        self.device_name = str(self.device_name or "").strip()
+        self.show_original = bool(self.show_original)
+        self.vad_enabled = bool(self.vad_enabled)
+        self.click_through = bool(self.click_through)
+        try:
+            self.vad_threshold = max(0, min(5000, int(self.vad_threshold)))
+        except (TypeError, ValueError):
+            self.vad_threshold = 200
+        self.text_color = str(self.text_color or "#FFFFFF").strip()
+        if not (self.text_color.startswith("#") and len(self.text_color) in (4, 7)):
+            self.text_color = "#FFFFFF"
+        try:
+            self.bg_opacity = max(0, min(255, int(self.bg_opacity)))
+        except (TypeError, ValueError):
+            self.bg_opacity = 170
         try:
             self.font_size = max(10, min(48, int(self.font_size)))
         except (TypeError, ValueError):
