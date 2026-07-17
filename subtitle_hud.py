@@ -151,10 +151,10 @@ class SubtitleHud(QWidget):
         if kind == "error":
             self.label.setText(message)
 
-    def set_running(self, running: bool) -> None:
+    def set_running(self, running: bool, clear: bool = True) -> None:
         self._is_running = running
         self.btn_toggle.setText("■" if running else "▶")
-        if running:
+        if running and clear:
             self.clear_text()
             self.label.setText("正在聆听…")
 

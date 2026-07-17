@@ -31,6 +31,10 @@ KIND_ERROR = "error"
 KIND_INFO = "info"
 
 
+class _GoAway(Exception):
+    """服务端发来 goAway：会话时长到期，需要立即重连（非故障）。"""
+
+
 class GeminiClient(QObject):
     subtitle = Signal(str)        # 增量译文文本
     turnComplete = Signal()       # 一句结束
@@ -142,10 +146,22 @@ class GeminiClient(QObject):
                     self.status.emit(KIND_ERROR, "API key 无效或无权限")
                     return
                 self.status.emit(KIND_ERROR, f"连接被拒绝 (HTTP {code})")
+            except _GoAway:
+                self.status.emit(KIND_INFO, "会话时长到期，正在续连…")
+                delay = 1.0
             except websockets.exceptions.ConnectionClosed as e:
-                code = getattr(getattr(e, "rcvd", None), "code", None)
-                if code is not None and code not in RECONNECTABLE_CLOSE_CODES:
-                    reason = getattr(getattr(e, "rcvd", None), "reason", "") or ""
+                frame = getattr(e, "rcvd", None)
+                code = getattr(frame, "code", None)
+                reason = str(getattr(frame, "reason", "") or "")
+                # 未处理 goAway 时服务端会以 1008 关闭，同样按会话到期续连
+                session_expired = code == 1008 and (
+                    "GoAway" in reason or "session" in reason.lower()
+                )
+                if (
+                    code is not None
+                    and code not in RECONNECTABLE_CLOSE_CODES
+                    and not session_expired
+                ):
                     self.status.emit(KIND_ERROR, f"连接被关闭 ({code}) {reason}")
                     return
                 self.status.emit(KIND_INFO, "连接断开，准备重连")
@@ -207,6 +223,8 @@ class GeminiClient(QObject):
             root = self._parse(raw)
             if root is None:
                 continue
+            if "goAway" in root:
+                raise _GoAway()
             err = root.get("error")
             if isinstance(err, dict):
                 raise RuntimeError(f"Gemini 错误: {err.get('message', '未知')}")

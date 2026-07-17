@@ -20,6 +20,7 @@ class App:
         self.cfg = Config.load()
         self.client = GeminiClient()
         self.capture: AudioCapture | None = None
+        self._pending_restart = False
 
         self.hud = SubtitleHud(font_size=self.cfg.font_size, width=self.cfg.hud_width)
         if self.cfg.hud_x >= 0 and self.cfg.hud_y >= 0:
@@ -41,7 +42,7 @@ class App:
 
     # ---- 会话控制 ----
 
-    def start_session(self) -> None:
+    def start_session(self, preserve_text: bool = False) -> None:
         if not self.cfg.api_key:
             self.open_settings()
             if not self.cfg.api_key:
@@ -60,7 +61,7 @@ class App:
             model=self.cfg.model,
             target_lang=self.cfg.target_language,
         )
-        self.hud.set_running(True)
+        self.hud.set_running(True, clear=not preserve_text)
 
     def stop_session(self) -> None:
         if self.capture is not None:
@@ -74,19 +75,30 @@ class App:
         if self.capture is not None:
             self.capture.stop()
             self.capture = None
-        self.hud.set_running(False)
+        self.hud.set_running(False, clear=False)
+        if self._pending_restart:
+            self._pending_restart = False
+            self.start_session(preserve_text=True)
 
     # ---- 设置 / 退出 ----
 
     def open_settings(self) -> None:
-        was_running = self.client.running
-        if was_running:
-            self.stop_session()
+        # 会话保持运行；只有确定且改了关键项才无缝重启（保留字幕）
+        before = (
+            self.cfg.api_key, self.cfg.api_base, self.cfg.model,
+            self.cfg.target_language, self.cfg.audio_source,
+        )
         dlg = SettingsDialog(self.cfg, parent=self.hud)
-        if dlg.exec():
-            self.hud.set_font_size(self.cfg.font_size)
-        if was_running:
-            self.start_session()
+        if not dlg.exec():
+            return
+        self.hud.set_font_size(self.cfg.font_size)
+        after = (
+            self.cfg.api_key, self.cfg.api_base, self.cfg.model,
+            self.cfg.target_language, self.cfg.audio_source,
+        )
+        if after != before and self.client.running:
+            self._pending_restart = True
+            self.stop_session()
 
     def quit(self) -> None:
         self.stop_session()
